@@ -1,0 +1,467 @@
+#!/usr/bin/env bash
+# nxadd: add a Switch game you dumped to your games folder, ready for NX Play, and optionally build it.
+#
+# usage: nxadd                                 asks for everything (drag the game's file or folder in)
+#        nxadd [options] <name> <source>...    no questions: copies <source> into <games folder>/<name>
+#        nxadd --setup                         choose again where your games are kept
+#
+#   <source>             .nsp .xci .nsz .xcz files, archives holding them (.7z .zip .rar), or folders of either
+#   --build              build it after copying (NX Play's nxplay --build-only), keeping the Mac awake
+#   --delete-download    once the copy on an external drive is checked, delete the download from this Mac
+#                        (without it nxadd asks, and its default answer is no)
+#   --dry-run            check everything and say what would happen; copy and build nothing
+#   --yes                take the default answer to every question
+#   --version, --help
+#
+# The first run asks where to keep games: on this Mac, or on an external drive. An exFAT or FAT32 drive gets an
+# APFS disk image on it (NXGames.sparsebundle): if the drive is unplugged mid-write only that file can suffer,
+# and NX Play's Mac apps share data with the build there instead of copying it. The answers are kept in
+# ~/.config/nxadd/config.
+#
+# Safety: nxadd never formats or erases a drive (it only creates the disk image file, after you say yes) and
+# writes only inside the games folder you chose. It deletes a download only when you say so, only from this
+# Mac, and only after its copy on the external drive was checked byte for byte (or unpacked with 7z's checks).
+set -euo pipefail
+VERSION=1.0.0
+
+# Settings (environment variables, mostly for testing)
+CONFIG="${NXADD_CONFIG:-$HOME/.config/nxadd/config}"
+VOLUMES="${NXADD_VOLUMES:-/Volumes}"                     # where external drives are listed from
+IMAGE_NAME="${NXADD_IMAGE_NAME:-NXGames}"                # the disk image's volume name
+IMAGE_SIZE="${NXADD_IMAGE_SIZE:-500g}"                   # its largest size; it only takes what it holds
+MARGIN_GB="${NXADD_MARGIN_GB:-10}"                       # free space wanted beyond 2x the game
+NXPLAY_DOMAIN="${NXADD_NXPLAY_DOMAIN:-com.varyform.nxplay}"
+NXPLAY_SUPPORT="$HOME/Library/Application Support/NX Play"
+NXN="${NXADD_NXNATIVE:-$NXPLAY_SUPPORT/nxnative}"
+NXPLAY_APP="${NXADD_NXPLAY_APP:-/Applications/NX Play.app}"
+NXPLAY="${NXADD_NXPLAY:-$NXPLAY_APP/Contents/Resources/nxplay}"
+VENV="${NXADD_VENV:-$NXPLAY_SUPPORT/venv}"
+KEYS="${NX_KEYS:-$HOME/.switch/prod.keys}"
+GAME_EXT='nsp|xci|nsz|xcz'
+
+# ---- output ----------------------------------------------------------------------------------------
+tty_out=0; [[ -t 1 ]] && tty_out=1
+if (( tty_out )) && [[ -z "${NO_COLOR:-}" ]]; then
+  BOLD=$'\033[1m' DIM=$'\033[2m' BLUE=$'\033[34m' CYAN=$'\033[36m' GREEN=$'\033[32m' YELLOW=$'\033[33m' RED=$'\033[31m' OFF=$'\033[0m'
+else
+  BOLD="" DIM="" BLUE="" CYAN="" GREEN="" YELLOW="" RED="" OFF=""
+fi
+step() { printf '\n%s%s●%s %s%s%s\n' "$BOLD" "$BLUE" "$OFF" "$BOLD" "$*" "$OFF"; }
+ok()   { printf '  %s✓%s %s\n' "$GREEN" "$OFF" "$*"; }
+info() { printf '  %s· %s%s\n' "$DIM" "$*" "$OFF"; }
+warn() { printf '  %s!%s %s\n' "$YELLOW" "$OFF" "$*"; }
+die()  { clear_line; printf '\n  %s✗ %s%s\n\n' "$RED" "$*" "$OFF" >&2; exit 1; }
+gb()   { awk -v b="$1" 'BEGIN { printf "%.1f GB", b / 1e9 }'; }
+clear_line() { (( tty_out )) && printf '\r\033[K' || true; }
+# progress <label> <done bytes> <total bytes>: one line, redrawn in place (terminal only)
+progress() {
+  (( tty_out )) || return 0
+  local pct=0 w=24 fill bar
+  (( $3 > 0 )) && pct=$(( $2 * 100 / $3 )); (( pct > 100 )) && pct=100
+  fill=$(( pct * w / 100 ))
+  bar="$(printf '%*s' "$fill" '' | tr ' ' '#')$(printf '%*s' $(( w - fill )) '' | tr ' ' '.')"
+  printf '\r\033[K  %s↻%s %s %s[%s]%s %3d%%  %s%s / %s%s' "$CYAN" "$OFF" "$1" "$DIM" "$bar" "$OFF" "$pct" "$DIM" "$(gb "$2")" "$(gb "$3")" "$OFF"
+}
+working() { (( tty_out )) && printf '\r\033[K  %s↻%s %s' "$CYAN" "$OFF" "$*" || true; }
+
+build=0 dry=0 yes=0 setup=0 delete_src=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --build) build=1; shift ;;
+    --dry-run) dry=1; shift ;;
+    --yes|-y) yes=1; shift ;;
+    --setup) setup=1; shift ;;
+    --delete-download) delete_src=1; shift ;;
+    --version) echo "nxadd $VERSION"; exit 0 ;;
+    -h|--help) sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -*) die "unknown option $1 (nxadd --help)" ;;
+    *) break ;;
+  esac
+done
+interactive=0
+[[ -t 0 || -n "${NXADD_INTERACTIVE:-}" ]] && interactive=1
+(( yes )) && interactive=0
+
+# ask "question" default(y|n): returns 0 for yes
+ask() {
+  local q="$1" def="$2" a hint="Y/n"
+  [[ "$def" == n ]] && hint="y/N"
+  if (( !interactive )); then [[ "$def" == y ]]; return; fi
+  printf '  %s%s?%s %s %s(%s)%s ' "$BOLD" "$CYAN" "$OFF" "$q" "$DIM" "$hint" "$OFF"
+  IFS= read -r a || a=""
+  a="$(printf '%s' "$a" | tr 'A-Z' 'a-z' | tr -d ' ')"
+  [[ -z "$a" ]] && a="$def"
+  [[ "$a" == y* ]]
+}
+# choose "question" option...: prints the chosen option's number (1-based)
+choose() {
+  local q="$1" i a o; shift
+  (( interactive )) || { echo 1; return; }
+  printf '  %s%s?%s %s\n' "$BOLD" "$CYAN" "$OFF" "$q" >&2
+  i=1; for o in "$@"; do printf '      %s%d%s  %s\n' "$BOLD" "$i" "$OFF" "$o" >&2; i=$((i + 1)); done
+  while true; do
+    printf '    %s›%s ' "$CYAN" "$OFF" >&2; IFS= read -r a || die "no answer"
+    if [[ "$a" =~ ^[0-9]+$ ]] && (( a >= 1 && a <= $# )); then echo "$a"; return; fi
+    printf '    %stype a number from 1 to %d%s\n' "$DIM" "$#" "$OFF" >&2
+  done
+}
+# a path typed or dragged into Terminal: quotes and backslash escapes removed, ~ expanded
+clean_path() {
+  local p="$1"
+  p="${p#"${p%%[![:space:]]*}"}"; p="${p%"${p##*[![:space:]]}"}"
+  if [[ "$p" == \'*\' || "$p" == \"*\" ]]; then p="${p:1:${#p}-2}"; else p="$(printf '%s' "$p" | sed 's/\\\(.\)/\1/g')"; fi
+  [[ "$p" == "~"* ]] && p="$HOME${p:1}"
+  printf '%s' "$p"
+}
+plist_get() {   # plist_get <key>: reads a plist on stdin, prints that top-level key's value
+  python3 -I -c 'import plistlib,sys; print(plistlib.loads(sys.stdin.buffer.read()).get(sys.argv[1], ""))' "$1" 2>/dev/null || true
+}
+fs_of()      { diskutil info -plist "$(cd -P "$1" && pwd)" 2>/dev/null | plist_get FilesystemType; }
+fs_name()    { case "$1" in exfat) echo exFAT ;; msdos) echo FAT32 ;; apfs) echo APFS ;; hfs) echo "Mac OS Extended" ;; ntfs) echo NTFS ;; *) echo "$1" ;; esac; }
+drive_free() { echo $(( $(df -k "$1" | awk 'NR==2 {print $4}') * 1024 )); }
+on_mac()     { local m; m="$(df -P "$1" 2>/dev/null | awk 'NR==2 {print $6}')"; [[ "$m" == / || "$m" == /System/Volumes/Data ]]; }
+image_mount() {   # the mount point of an attached disk image, or nothing
+  hdiutil info -plist 2>/dev/null | python3 -I -c '
+import os, plistlib, sys
+want = os.path.realpath(sys.argv[1])
+for im in plistlib.loads(sys.stdin.buffer.read()).get("images", []):
+    if os.path.realpath(im.get("image-path", "")) == want:
+        for e in im.get("system-entities", []):
+            if e.get("mount-point"): print(e["mount-point"]); sys.exit()' "$1" 2>/dev/null || true
+}
+open_image() {   # attaches $1 if needed, prints its mount point
+  local m; m="$(image_mount "$1")"
+  if [[ -z "$m" ]]; then hdiutil attach "$1" > /dev/null 2>&1 || return 1; m="$(image_mount "$1")"; fi
+  [[ -n "$m" ]] && printf '%s' "$m"
+}
+
+printf '\n%snxadd%s %s· add a Switch game for NX Play%s\n' "$BOLD" "$OFF" "$DIM" "$OFF"
+
+# ---- before you start: what building needs (copying needs none of it) ---------------------------------
+step "Before you start"
+can_build=1
+need() { can_build=0; printf '  %s✗%s %s\n      %s→ %s%s\n' "$RED" "$OFF" "$1" "$DIM" "$2" "$OFF"; }
+if [[ "$(uname -s)" != Darwin || "$(uname -m)" != arm64 ]]; then need "this isn't a Mac with Apple silicon" "nxnative runs Switch games on Apple silicon Macs only"
+elif [[ ! -d "$NXPLAY_APP" ]]; then need "NX Play isn't installed" "get it from github.com/varyform/nx-native-wrapper/releases and open it once"
+elif [[ ! -d "$NXN/.git" || ! -x "$VENV/bin/python3" ]]; then need "NX Play's setup isn't finished (nxnative and its Python tools)" "open NX Play › Settings › Setup and click Install Missing"
+elif ! xcrun --find metal > /dev/null 2>&1; then need "Xcode's Metal compiler is missing (shaders need it)" "open NX Play › Settings › Setup and click Install Missing"
+else ok "NX Play and its setup"; fi
+if [[ -f "$KEYS" ]]; then ok "prod.keys $DIM($KEYS)$OFF"
+else need "no prod.keys at $KEYS" "dump the keys from your own Switch (Lockpick_RCM) and put the file there"; fi
+(( can_build )) || info "you can still add games now; build them once the items above are fixed"
+
+# ---- setup -----------------------------------------------------------------------------------------
+save_config() {
+  mkdir -p "$(dirname "$CONFIG")"
+  { echo "# nxadd's settings (nxadd --setup changes them)"
+    printf 'GAMES_DIR=%q\nIMAGE=%q\n' "$GAMES_DIR" "$IMAGE"; } > "$CONFIG"
+}
+saved() { ok "Saved: games go in $BOLD$GAMES_DIR$OFF${1:+ $DIM($1)$OFF}"; }
+run_setup() {
+  (( interactive )) || die "nxadd isn't set up yet: run nxadd in a Terminal to answer its questions (or nxadd --setup)"
+  step "Setup: where should your games live?"
+  local c d fs free name real info drives=() labels=()
+  c=$(choose "Where do you want to keep your games?" "On this Mac $DIM(~/Games)$OFF" "On an external drive")
+  if (( c == 1 )); then
+    GAMES_DIR="$HOME/Games" IMAGE=""
+    mkdir -p "$GAMES_DIR"; save_config; saved; return
+  fi
+  for d in "$VOLUMES"/*; do
+    [[ -d "$d" ]] || continue
+    real="$(cd -P "$d" && pwd)"
+    [[ "$(df -P "$real" | awk 'NR==2 {print $6}')" == "/" ]] && continue          # the Mac's own disk
+    info="$(diskutil info -plist "$real" 2>/dev/null || true)"
+    [[ -n "$info" ]] || continue
+    [[ "$(printf '%s' "$info" | plist_get Internal)" == True ]] && continue
+    if [[ -z "${NXADD_ALLOW_IMAGES:-}" && "$(printf '%s' "$info" | plist_get BusProtocol)" == "Disk Image" ]]; then continue; fi
+    fs="$(fs_name "$(printf '%s' "$info" | plist_get FilesystemType)")"; [[ "$fs" == NTFS ]] && fs="NTFS, read-only"
+    free=$(drive_free "$real")
+    drives+=("$real"); labels+=("$(basename "$d") $DIM($fs, $(gb "$free") free)$OFF")
+  done
+  (( ${#drives[@]} )) || die "no external drive is connected: plug it in and run nxadd --setup again"
+  c=$(choose "Which drive?" "${labels[@]}")
+  d="${drives[$((c - 1))]}"; name="$(basename "$d")"; fs="$(fs_of "$d")"
+  case "$fs" in
+    ntfs) die "$name is NTFS, which a Mac can only read: choose another drive" ;;
+    apfs|hfs) GAMES_DIR="$d/NXGames" IMAGE=""; mkdir -p "$GAMES_DIR"; save_config; saved; return ;;
+  esac
+  # exFAT / FAT32: a disk image on it
+  IMAGE="$d/$IMAGE_NAME.sparsebundle"
+  if [[ -d "$IMAGE" ]]; then
+    if ask "$name already has $IMAGE_NAME.sparsebundle. Use it for your games?" y; then
+      GAMES_DIR="$(open_image "$IMAGE")" || die "couldn't open $IMAGE"
+      save_config; saved "inside $name/$IMAGE_NAME.sparsebundle"; return
+    fi
+  else
+    info "$name is formatted $(fs_name "$fs"). A disk image on it keeps your games safer if the drive is"
+    info "unplugged mid-write, and saves about 10 GB per game. It grows as you add games."
+  fi
+  if [[ ! -d "$IMAGE" ]] && ask "Keep your games in a disk image on $name?" y; then
+    working "creating $IMAGE_NAME.sparsebundle on $name"
+    hdiutil create -size "$IMAGE_SIZE" -type SPARSEBUNDLE -fs APFS -volname "$IMAGE_NAME" "$IMAGE" > /dev/null 2>&1 || die "couldn't create $IMAGE"
+    GAMES_DIR="$(open_image "$IMAGE")" || die "couldn't open $IMAGE"
+    clear_line; save_config; saved "inside $name/$IMAGE_NAME.sparsebundle"; return
+  fi
+  [[ "$fs" == msdos ]] && die "$name is FAT32, which can't hold files over 4 GB (most games): use the disk image, or another drive"
+  GAMES_DIR="$d/NXGames" IMAGE=""
+  mkdir -p "$GAMES_DIR"; save_config; saved
+}
+
+GAMES_DIR="" IMAGE=""
+if (( setup )) || [[ ! -f "$CONFIG" ]]; then
+  run_setup
+  (( setup )) && { echo; exit 0; }
+else
+  # shellcheck disable=SC1090
+  source "$CONFIG"
+fi
+
+# ---- the games folder ------------------------------------------------------------------------------
+step "Games folder"
+if [[ -n "$IMAGE" ]]; then
+  [[ -d "$(dirname "$IMAGE")" ]] || die "the drive with your games isn't connected ($(dirname "$IMAGE")): plug it in and try again"
+  [[ -d "$IMAGE" ]] || die "the disk image is gone: $IMAGE (nxadd --setup to choose again)"
+  m="$(open_image "$IMAGE")" || die "couldn't open $IMAGE"
+  [[ "$m" == "$GAMES_DIR" ]] || { warn "the disk image opened at $m (was $GAMES_DIR)"; GAMES_DIR="$m"; save_config; }
+  ok "$GAMES_DIR $DIM(inside $(basename "$(dirname "$IMAGE")")/$(basename "$IMAGE"))$OFF"
+  if mdutil -s "$GAMES_DIR" 2>/dev/null | grep -q "Indexing enabled"; then
+    mdutil -i off "$GAMES_DIR" > /dev/null 2>&1 && info "turned Spotlight indexing off on it" || true
+  fi
+  space_on="$(dirname "$IMAGE")"
+else
+  [[ -d "$GAMES_DIR" ]] || die "$GAMES_DIR isn't there: is its drive connected? (nxadd --setup to choose again)"
+  ok "$GAMES_DIR"
+  space_on="$GAMES_DIR"
+fi
+
+# ---- what to add -----------------------------------------------------------------------------------
+name="" ; sources=() ; mac=()
+if [[ $# -ge 2 ]]; then
+  name="$1"; shift; sources=("$@")
+elif [[ $# -eq 1 ]]; then
+  sources=("$1")
+else
+  (( interactive )) || die "nothing to add (nxadd --help)"
+  echo
+  printf '  %s%s?%s Where is the game? Type the path to its file, folder or archive %s(or drag it into this window)%s, then press Return\n    %s›%s ' "$BOLD" "$CYAN" "$OFF" "$DIM" "$OFF" "$CYAN" "$OFF"
+  IFS= read -r line || die "no answer"
+  sources=("$(clean_path "$line")")
+fi
+
+step "Game files"
+games=() archives=()
+add_file() {
+  local f="$1" base; base="$(basename "$f")"
+  [[ "$base" == ._* ]] && return 0            # AppleDouble files macOS writes on exFAT
+  shopt -s nocasematch
+  if [[ "$base" =~ \.($GAME_EXT)$ ]]; then games+=("$f")
+  elif [[ "$base" =~ \.(7z|zip|rar)$ ]]; then archives+=("$f")
+  fi
+  shopt -u nocasematch
+}
+for src in "${sources[@]}"; do
+  src="$(clean_path "$src")"
+  [[ -e "$src" ]] || die "not found: $src"
+  if [[ -d "$src" ]]; then
+    while IFS= read -r -d '' f; do add_file "$f"; done < <(find "$src" -type f -print0)
+  else
+    add_file "$src"
+  fi
+done
+[[ ${#games[@]} -gt 0 || ${#archives[@]} -gt 0 ]] || die "no game files (.nsp .xci .nsz .xcz) or archives of them there"
+
+names=() total=0
+if [[ ${#games[@]} -gt 0 ]]; then
+  for f in "${games[@]}"; do
+    names+=("$(basename "$f")"); total=$(( total + $(stat -f %z "$f") ))
+    ok "$(basename "$f") $DIM($(gb "$(stat -f %z "$f")"))$OFF"
+  done
+fi
+if [[ ${#archives[@]} -gt 0 ]]; then
+  if ! command -v 7z > /dev/null; then
+    if command -v brew > /dev/null && ask "Unpacking archives needs 7z. Install it with Homebrew now?" y; then
+      brew install p7zip || die "installing 7z failed"
+    else
+      die "unpacking archives needs 7z: brew install p7zip (or unpack it yourself and give nxadd the folder)"
+    fi
+  fi
+  for a in "${archives[@]}"; do
+    inner=0
+    while IFS=$'\t' read -r size path; do
+      shopt -s nocasematch
+      if [[ "$path" =~ \.($GAME_EXT)$ && "$(basename "$path")" != ._* ]]; then names+=("$(basename "$path")"); total=$(( total + size )); inner=$((inner + 1)); fi
+      shopt -u nocasematch
+    done < <(7z l -slt "$a" 2>/dev/null | awk -F' = ' '/^Path = /{p=$2} /^Size = /{print $2 "\t" p}')
+    if (( inner )); then ok "$(basename "$a") $DIM($inner game file(s) inside)$OFF"; else warn "$(basename "$a"): no game files inside, skipped"; fi
+  done
+fi
+[[ ${#names[@]} -gt 0 ]] || die "found no game files"
+
+# title ID: from [IDs] in the names, else from an NSP's ticket (<title ID><key generation>.tik in its header)
+ids=$(printf '%s\n' "${names[@]}" | grep -oE '\[[0-9A-Fa-f]{16}\]' | tr -d '[]' | tr 'a-f' 'A-F' | sort -u || true)
+if [[ -z "$ids" && ${#games[@]} -gt 0 ]]; then
+  for f in "${games[@]}"; do
+    ids="$ids $(python3 -I - "$f" <<'PY' 2>/dev/null || true
+import struct, sys
+with open(sys.argv[1], 'rb') as f:
+    h = f.read(16)
+    if h[:4] != b'PFS0': sys.exit()
+    n, st = struct.unpack('<II', h[4:12]); f.seek(16 + 24 * n)
+    for name in f.read(st).split(b'\0'):
+        if name.endswith(b'.tik') and len(name) == 36: print(name[:16].decode().upper())
+PY
+)"
+  done
+  ids=$(printf '%s\n' $ids | sort -u)
+fi
+base_id="" title=""
+for id in $ids; do   # base and update (…800) share the base's ID; a DLC is base + 0x1000 + n
+  low=$(( 16#${id:13:3} ))
+  if (( low == 0 || low == 0x800 )); then cand="${id:0:13}000"; else cand=$(printf '%016X' $(( (16#$id & ~0xFFF) - 0x1000 ))); fi
+  if [[ -z "$base_id" || "$cand" < "$base_id" ]]; then base_id="$cand"; fi
+done
+if [[ -n "$base_id" ]]; then
+  note="$NXN/dm/games/$base_id/README.md"
+  if [[ -f "$note" ]]; then
+    title="$(sed -n '1s/^# //p' "$note" | sed -E 's/ \(`[0-9A-Fa-f]{16}`\)$//')"
+    ok "$BOLD$title$OFF $DIM($base_id)$OFF is supported by nxnative"
+    info "what's known about it: $note"
+  else
+    warn "$base_id isn't in nxnative's games list: the build guesses its settings, and it may not start"
+  fi
+else
+  info "couldn't read the title ID here (an .xci keeps it inside); NX Play reads it from the files"
+fi
+printf '%s\n' "${names[@]}" | grep -qiE '\[[0-9A-F]{13}800\]|update' || info "no update among the files (fine if the game has none)"
+
+# ---- name ------------------------------------------------------------------------------------------
+safe_name() { printf '%s' "$1" | sed -E "s/[^A-Za-z0-9 ._'&+!,()-]+/ /g; s/  +/ /g; s/^ //; s/ \$//"; }
+if [[ -z "$name" ]]; then
+  if [[ -n "$title" ]]; then name="$(safe_name "$title")"
+  else first="$(basename "${sources[0]}")"; name="$(safe_name "$(printf '%s' "${first%.*}" | sed -E 's/\[[^]]*\]//g')")"; fi
+  if (( interactive )) && ! ask "Call it \"$name\"?" y; then
+    printf '    %sname ›%s ' "$CYAN" "$OFF"; IFS= read -r name || die "no answer"; name="$(safe_name "$name")"
+  fi
+fi
+[[ -n "$name" && "$name" != .* && "$name" != */* ]] || die "\"$name\" won't do as a folder name"
+dest="$GAMES_DIR/$name"
+
+# ---- space -----------------------------------------------------------------------------------------
+free=$(drive_free "$space_on")
+need=$(( total * 2 + MARGIN_GB * 1000 * 1000 * 1000 ))
+(( free >= need )) || die "not enough space: it needs about $(gb $need) while it builds, and $(gb "$free") is free"
+ok "$(gb $total) to copy; $(gb "$free") free $DIM(about $(gb $need) needed while it builds)$OFF"
+
+# ---- copy ------------------------------------------------------------------------------------------
+step "Copy to $dest"
+copied=()   # downloads whose copy in $dest is checked
+copy_checked() {   # copy_checked <file> <target>: copies through <target>.part, compares, renames
+  local f="$1" t="$2" size pid cur
+  size=$(stat -f %z "$f")
+  cp "$f" "$t.part" & pid=$!
+  while kill -0 "$pid" 2>/dev/null; do
+    cur=$(stat -f %z "$t.part" 2>/dev/null || echo 0)
+    progress "copying" "$cur" "$size"; sleep 1
+  done
+  wait "$pid" || { rm -f "$t.part"; return 1; }
+  working "checking the copy against the original"
+  cmp -s "$f" "$t.part" || { rm -f "$t.part"; return 1; }
+  mv "$t.part" "$t"; clear_line
+}
+if (( dry )); then
+  info "dry run: would copy ${#names[@]} file(s) here"
+else
+  mkdir -p "$dest"
+  if [[ ${#games[@]} -gt 0 ]]; then
+    for f in "${games[@]}"; do
+      t="$dest/$(basename "$f")"
+      if [[ "$(cd -P "$(dirname "$f")" && pwd)" == "$(cd -P "$dest" && pwd)" ]]; then ok "$(basename "$f") $DIM(already here)$OFF"; continue; fi
+      if [[ -f "$t" ]] && cmp -s "$f" "$t"; then ok "$(basename "$f") $DIM(already here, same file)$OFF"; copied+=("$f"); continue; fi
+      copy_checked "$f" "$t" || die "copying $(basename "$f") failed"
+      ok "$(basename "$f") $DIM(copied and checked)$OFF"; copied+=("$f")
+    done
+  fi
+  if [[ ${#archives[@]} -gt 0 ]]; then
+    for a in "${archives[@]}"; do
+      tmp="$dest/.unpack-$$"; rm -rf "$tmp"; mkdir -p "$tmp"
+      asize=$(7z l -slt "$a" 2>/dev/null | awk -F' = ' '/^Size = /{s+=$2} END {print s+0}')
+      7z x -y -o"$tmp" "$a" > "$tmp.log" 2>&1 & pid=$!
+      while kill -0 "$pid" 2>/dev/null; do progress "unpacking" $(( $(du -sk "$tmp" | awk '{print $1}') * 1024 )) "$asize"; sleep 1; done
+      wait "$pid" || { clear_line; rm -rf "$tmp"; die "unpacking $(basename "$a") failed (see $tmp.log)"; }
+      clear_line
+      while IFS= read -r -d '' f; do
+        bn="$(basename "$f")"
+        [[ "$bn" == ._* ]] && continue
+        shopt -s nocasematch; if [[ ! "$bn" =~ \.($GAME_EXT)$ ]]; then shopt -u nocasematch; continue; fi; shopt -u nocasematch
+        mv "$f" "$dest/$bn"; ok "$bn $DIM(unpacked from $(basename "$a"), checked by 7z)$OFF"
+      done < <(find "$tmp" -type f -print0)
+      rm -rf "$tmp" "$tmp.log"
+      copied+=("$a")
+    done
+  fi
+
+  # the download on this Mac: offered for deletion once its copy on an external drive is checked
+  if [[ ${#copied[@]} -gt 0 ]] && ! on_mac "$dest"; then
+    size=0
+    for f in "${copied[@]}"; do if on_mac "$f"; then mac+=("$f"); size=$(( size + $(stat -f %z "$f") )); fi; done
+    if [[ ${#mac[@]} -gt 0 ]]; then
+      echo
+      if (( delete_src )) || ask "The copy is checked. Delete the download from this Mac to free $(gb $size)?" n; then
+        for f in "${mac[@]}"; do rm -f "$f" && ok "deleted $DIM$f$OFF"; done
+        for src in "${sources[@]}"; do   # a folder you gave, once only Finder's leftovers remain in it
+          src="$(clean_path "$src")"
+          if [[ -d "$src" ]] && on_mac "$src" && [[ -z "$(find "$src" -type f ! -name .DS_Store ! -name '._*' -print -quit)" ]]; then
+            rm -rf "$src" && ok "deleted the emptied folder $DIM$src$OFF"
+          fi
+        done
+      else
+        info "kept the download ($(gb $size)); delete it yourself once the game plays"
+      fi
+    fi
+  fi
+fi
+
+# ---- NX Play ---------------------------------------------------------------------------------------
+step "NX Play"
+if defaults read "$NXPLAY_DOMAIN" gamesRoots 2>/dev/null | grep -qF "\"$GAMES_DIR\""; then
+  ok "NX Play already shows $GAMES_DIR"
+elif [[ "$NXPLAY_DOMAIN" == com.varyform.nxplay ]] && pgrep -xq "NX Play"; then   # it would overwrite the change when it quits
+  warn "NX Play is open: add $GAMES_DIR in its Settings › General › Games Folders"
+elif (( dry )); then
+  info "dry run: would add $GAMES_DIR to NX Play's games folders"
+else
+  defaults write "$NXPLAY_DOMAIN" gamesRoots -array-add "$GAMES_DIR" && ok "added $GAMES_DIR to NX Play's games folders"
+fi
+
+# ---- build -----------------------------------------------------------------------------------------
+if (( build && !can_build && !dry )); then
+  echo; warn "not building: fix the ✗ items under \"Before you start\", then build it from NX Play"; build=0
+fi
+if (( !build && !dry && interactive && can_build )); then
+  echo
+  ask "Build it now? A big game can take an hour; keep the Mac plugged in." y && build=1
+fi
+if (( build && !dry )); then
+  step "Build"
+  info "keep the Mac plugged in${IMAGE:+ and the drive connected}; the log is $dest/nxadd-build.log"
+  log="$dest/nxadd-build.log"
+  set +e
+  NXNATIVE="$NXN" NXPLAY_VENV="$VENV" caffeinate -ims "$NXPLAY" --build-only "$dest" 2>&1 | tee "$log"
+  rc=${PIPESTATUS[0]}
+  set -e
+  if grep -q "shader compile cache .* is damaged" "$dest"/*_build/logs/dmsh_build.log 2>/dev/null; then
+    warn "the shader cache came out damaged: run the same nxadd again; if it happens twice, please report it"
+  fi
+  (( rc == 0 )) || die "the build failed (exit $rc); its log: $log"
+fi
+
+# ---- summary ---------------------------------------------------------------------------------------
+echo
+if (( dry )); then
+  printf '  %s%s✓ Dry run done:%s nothing was copied or changed.\n\n' "$BOLD" "$GREEN" "$OFF"
+elif (( build )); then
+  printf '  %s%s✓ %s is ready.%s Open NX Play to play it.\n\n' "$BOLD" "$GREEN" "$name" "$OFF"
+else
+  printf '  %s%s✓ %s is added.%s Open NX Play and click it to build and play.\n\n' "$BOLD" "$GREEN" "$name" "$OFF"
+fi
+if [[ ${#mac[@]} -eq 0 || -e "${mac[0]}" ]] && (( !dry )); then info "your download is untouched: delete it once the game plays"; echo; fi
